@@ -11,68 +11,138 @@ from slack_sdk.errors import SlackApiError
 console = Console()
 load_dotenv()
 
-class TrainInfo(BaseModel):
-    train_number: str = Field(..., description="Train number")
-    departure_time: str = Field(..., description="Departure time in YYYYMMDDTHHMMSS format")
-    destination: str = Field(..., description="Destination station")
-    physical_mode: str = Field(..., description="Physical mode")
-
-    # Formatting the departure time for better readability
-    def formatted_departure_time(self) -> str:
-        # Convertir le string en objet datetime
-        dt = datetime.strptime(self.departure_time, "%Y%m%dT%H%M%S")
-        # Formatter pour l'affichage
-        return dt.strftime("%H:%M on %d/%m/%Y")
+class Departure(BaseModel):
+    origin: str
+    destination: str
+    aimed_departure_time: str
+    expected_departure_time: str
+    status: str
+    train_number: int
+    delay: int = 0
 
 
-def fetch_train_info(api_key: str, train_station: str) -> list[TrainInfo]:
-    url = f"https://api.sncf.com/v1/coverage/sncf/stop_areas/{train_station}/departures"
-    headers = {"Authorization": api_key}
-    params = {"count": 10}
+def fetch_next_departures(api_key: str, station_code: str) -> list[Departure]:
+    url = "https://prim.iledefrance-mobilites.fr/marketplace/stop-monitoring"
+
+    headers = {
+        "apiKey": api_key,
+    }
+
+    params = {
+        "MonitoringRef": station_code,
+    }
+
     response = requests.get(url, headers=headers, params=params)
     response.raise_for_status()
     data = response.json()
 
-    console.print(data)
-    
-    return [TrainInfo(
-        train_number=departure['display_informations']['trip_short_name'],
-        departure_time=departure['stop_date_time']['departure_date_time'],
-        destination=departure['display_informations']['direction'],
-        physical_mode=departure['display_informations']['physical_mode']
+    departures = []
+    visits = (
+        data.get("Siri", {})
+        .get("ServiceDelivery", {})
+        .get("StopMonitoringDelivery", [{}])[0]
+        .get("MonitoredStopVisit", [])
     )
-    for departure in data['departures']]
 
+    def parse_time(ts):
+        if not ts:
+            return None
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+    def format_time(dt):
+        return dt.strftime("%H:%M") if dt else "—"
+
+    def minutes_delay(aimed, expected):
+        if not aimed or not expected:
+            return 0
+        return int((expected - aimed).total_seconds() / 60)
+
+    for visit in visits:
+        mvj = visit.get("MonitoredVehicleJourney", {})
+        call = mvj.get("MonitoredCall", {})
+
+        aimed_dep = parse_time(call.get("AimedDepartureTime"))
+        expected_dep = parse_time(call.get("ExpectedDepartureTime"))
+
+        status_dep = call.get("DepartureStatus", "").lower()
+        status_arr = call.get("ArrivalStatus", "").lower()
+
+        cancelled = "cancel" in status_dep or "cancel" in status_arr
+
+        delay = minutes_delay(aimed_dep, expected_dep)
+
+        departures.append(
+            Departure(
+                origin=mvj.get("DirectionRef", {}).get("value", "—"),
+                destination=mvj.get("DestinationName", [{}])[0].get("value", "—"),
+                aimed_departure_time=format_time(aimed_dep),
+                expected_departure_time=format_time(expected_dep),
+                status="Cancelled" if cancelled else "On time" if delay == 0 else f"Delayed",
+                train_number=mvj.get("VehicleJourneyName", [{}])[0].get("value", "—"),
+                delay=delay,
+            )
+        )
+    return departures
+
+def format_departure_info(departures: list[Departure]) -> str:
+    emoji_status = {
+        "On time": "✅",
+        "Cancelled": "❌",
+        "Delayed": "⏰",
+    }
+    
+
+    lines = []
+    for dep in departures:
+        msg = ""
+        msg += f"{emoji_status.get(dep.status, '')} Train {dep.train_number} to {dep.destination} | "
+        msg += f"{dep.aimed_departure_time} → {dep.expected_departure_time} (+{dep.delay} min)" if dep.delay > 0 else f"{dep.aimed_departure_time} "
+        lines.append(msg)
+
+    return "\n".join(lines)
 
 
 def main():
-    api_key = getenv("SNCF_API_KEY")
+    api_key = getenv("IDF_API_KEY")
     if not api_key:
-        console.print("[red]Error: SNCF_API_KEY not found in environment variables.[/red]")
+        console.print("[red]Error: IDF_API_KEY not found in environment variables.[/red]")
         return
     
-    train_station = "stop_area:SNCF:87386649" 
+    train_station = "STIF:StopArea:SP:47966:" 
     try:
-        train_infos = fetch_train_info(api_key, train_station)
-        for info in train_infos:
-            console.print(f"[green]{info.physical_mode}[/green] to [blue]{info.destination}[/blue] departs at [yellow]{info.formatted_departure_time()}[/yellow]")
+        next_departures = fetch_next_departures(api_key, train_station)
     except requests.HTTPError as e:
         console.print(f"[red]HTTP Error: {e}[/red]")
         return
     
+    # sort and display all departures
+    sorted_trains = sorted(next_departures, key=lambda x: x.expected_departure_time)
+
+    msg = format_departure_info(sorted_trains)
+    console.print(msg)
+
     # filter for specific destination
     specific_destination = "Paris Saint-Lazare (Paris)"
-    filtered_trains = [info for info in train_infos 
-                       if info.destination == specific_destination and info.physical_mode != "Bus"]
+    filtered_trains = [departure for departure in sorted_trains 
+                       if departure.destination == specific_destination]
+
     console.print(f"\n[bold]Number of Trains to {specific_destination}:[/bold] {len(filtered_trains)}")
 
+    msg = format_departure_info(filtered_trains)
+    console.print(msg)
     return
+
     slack_token = getenv("SLACK_BOT_TOKEN")
     channel_id = getenv("CHANNEL_ID")
+    if not slack_token:
+        console.print("[red]Error: SLACK_BOT_TOKEN not found in environment variables.[/red]")
+        return
+    
     # A nice formated message for Slack with MRKDWN
     message_text = f"*Next Trains to {specific_destination}:* \n"
-    for info in filtered_trains:
-        message_text += f":train: *{info.train_number}* departs at *{info.formatted_departure_time()}*\n"
+    message_text += "```"
+    message_text += format_departure_info(filtered_trains)
+    message_text += "```"
 
     
     if not channel_id:
