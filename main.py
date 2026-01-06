@@ -32,6 +32,8 @@ def fetch_train_info(api_key: str, train_station: str) -> list[TrainInfo]:
     response = requests.get(url, headers=headers, params=params)
     response.raise_for_status()
     data = response.json()
+
+    console.print(data)
     
     return [TrainInfo(
         train_number=departure['display_informations']['trip_short_name'],
@@ -64,20 +66,29 @@ def main():
                        if info.destination == specific_destination and info.physical_mode != "Bus"]
     console.print(f"\n[bold]Number of Trains to {specific_destination}:[/bold] {len(filtered_trains)}")
 
+    return
     slack_token = getenv("SLACK_BOT_TOKEN")
+    channel_id = getenv("CHANNEL_ID")
+    # A nice formated message for Slack with MRKDWN
+    message_text = f"*Next Trains to {specific_destination}:* \n"
+    for info in filtered_trains:
+        message_text += f":train: *{info.train_number}* departs at *{info.formatted_departure_time()}*\n"
+
+    
+    if not channel_id:
+        console.print("[red]Error: CHANNEL_ID not found in environment variables.[/red]")
+        return
     
     client = WebClient(token=slack_token)
 
     try:
         response = client.chat_postMessage(
-            channel="C0XXXXXX",
-            text="Hello from your app! :tada:"
+            channel=channel_id, 
+            text=message_text
         )
     except SlackApiError as e:
         # You will get a SlackApiError if "ok" is False
         assert e.response["error"]    # str like 'invalid_auth', 'channel_not_found'
-
-
 
 
 if __name__ == "__main__":
