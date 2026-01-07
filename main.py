@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 from datetime import datetime
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
-
+from zoneinfo import ZoneInfo
 
 console = Console()
 load_dotenv()
@@ -47,7 +47,8 @@ def fetch_next_departures(api_key: str, station_code: str) -> list[Departure]:
     def parse_time(ts):
         if not ts:
             return None
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return dt.astimezone(PARIS_TZ)
 
     def format_time(dt):
         return dt.strftime("%H:%M") if dt else "—"
@@ -122,7 +123,7 @@ def main():
     console.print(msg)
 
     # filter for specific destination
-    specific_destination = "Paris Saint-Lazare (Paris)"
+    specific_destination = "Paris Saint-Lazare"
     filtered_trains = [departure for departure in sorted_trains 
                        if departure.destination == specific_destination]
 
